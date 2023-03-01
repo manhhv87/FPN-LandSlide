@@ -7,12 +7,14 @@ import os
 import torch
 import numpy as np
 from torch.autograd import Variable
+from torch.nn import functional as F
 
 from dataset import make_data_loader
 from utils.metrics import Evaluator
 from utils.saver import Saver
 from utils.loss import SegmentationLosses
 from model.FPN import FPN
+from utils import Kpar, helper
 
 
 def parse_args():
@@ -23,7 +25,7 @@ def parse_args():
                         help="dataset path.")
     parser.add_argument("--train_list", type=str, default='./data/train.txt',
                         help="training list file.")
-    parser.add_argument("--val_list", type=str, default='./data/val.txt',
+    parser.add_argument("--val_list", type=str, default='./data/valid.txt',
                         help="val list file.")
     parser.add_argument("--test_list", type=str, default='./data/test.txt',
                         help="test list file.")
@@ -31,7 +33,7 @@ def parse_args():
                         help='training dataset')
     parser.add_argument('--net', dest='net', type=str, default='resnet101',
                         help='resnet18, resnet34, resnet50, etc.')
-    parser.add_argument('--start_epoch', dest='start_epoch', type=int, default=1,
+    parser.add_argument('--start_epoch', dest='start_epoch', type=int, default=0,
                         help='starting epoch')
     parser.add_argument('--epochs', dest='epochs', type=int, default=50,
                         help='number of iterations to train')
@@ -55,9 +57,9 @@ def parse_args():
                         help='batch_size')
 
     # config optimization
-    parser.add_argument('--o', dest='optimizer', type=str, default='sgd',
+    parser.add_argument('--o', dest='optimizer', type=str, default='adam',
                         help='training optimizer')
-    parser.add_argument('--lr', dest='lr', type=float, default=1e-2,
+    parser.add_argument('--lr', dest='lr', type=float, default=1e-3,
                         help='starting learning rate')
     parser.add_argument('--weight_decay', dest='weight_decay', type=float, default=1e-5,
                         help='weight_decay')
@@ -115,18 +117,18 @@ class Trainer(object):
         self.args = args
 
         # Define Saver
-        self.saver = Saver(args)
+        self.saver = Saver(self.args)
         self.saver.save_experiment_config()
 
         # Define Dataloader
-        if args.dataset == 'Landslide4Sense':
-            kwargs = {'num_workers': args.num_workers, 'pin_memory': True}
+        if self.args.dataset == 'Landslide4Sense':
+            kwargs = {'num_workers': self.args.num_workers, 'pin_memory': True}
             self.train_loader, self.val_loader, self.test_loader = make_data_loader(args, **kwargs)
 
         # Define network
-        if args.net == 'resnet101':
+        if self.args.net == 'resnet101':
             blocks = [3, 4, 23, 3]
-            fpn = FPN(blocks, args.num_class, back_bone=args.net)
+            fpn = FPN(blocks, self.args.num_class, back_bone=self.args.net, pretrained=False)
 
         # Define Optimizer
         self.lr = self.args.lr
@@ -138,21 +140,21 @@ class Trainer(object):
             opt = torch.optim.SGD(fpn.parameters(), lr=args.lr, momentum=0, weight_decay=args.weight_decay)
 
         # Define criterion
-        if args.dataset == 'Cityscapes':
-            self.criterion = SegmentationLosses(weight=None, cuda=args.cuda).build_loss(mode='ce')
+        if self.args.dataset == 'Landslide4Sense':
+            self.criterion = SegmentationLosses(weight=None, cuda=self.args.cuda).build_loss(mode='ce')
 
         self.model = fpn
         self.optimizer = opt
 
         # Define Evaluator
-        self.evaluator = Evaluator(self.num_class)
+        self.evaluator = Evaluator(self.args.num_class)
 
         # multiple mGPUs
-        if args.mGPUs:
+        if self.args.mGPUs:
             self.model = torch.nn.DataParallel(self.model, device_ids=self.args.gpu_ids)
 
         # Using cuda
-        if args.cuda:
+        if self.args.cuda:
             self.model = self.model.cuda()
 
         # Resuming checkpoint
@@ -160,7 +162,7 @@ class Trainer(object):
         self.lr_stage = [68, 93]
         self.lr_stage_ind = 0
 
-    def training(self, epoch):
+    def training(self, epoch, kbar):
         train_loss = 0.0
         self.model.train()
 
@@ -179,21 +181,24 @@ class Trainer(object):
                 image, target = image.cuda(), target.cuda()
 
             self.optimizer.zero_grad()
+
             inputs = Variable(image)
             labels = Variable(target)
 
             outputs = self.model(inputs)
+
             loss = self.criterion(outputs, labels.long())
             # loss_train = loss.item()
             loss.backward(torch.ones_like(loss))
             self.optimizer.step()
             train_loss += loss.item()
 
-            if batch_id % 10 == 0:
-                print("Epoch[{}]({}/{}):Loss:{:.4f}, learning rate={}".format(epoch, batch_id, len(self.train_loader),
-                                                                              loss.data, self.lr))
-        print('[Epoch: %d, numImages: %5d]' % (epoch, batch_id * self.args.batch_size + image.data.shape[0]))
-        print('Loss: %.3f' % train_loss)
+            kbar.update(batch_id, values=[("loss", train_loss)])
+
+            # if batch_id % 10 == 0:
+            #     print("Epoch[{}]({}/{}):Loss:{:.5f}, learning rate={}".format(epoch, batch_id, len(self.train_loader),
+            #                                                                   loss.data, self.lr))
+        # print('Epoch: %d: Loss: %.5f' % (epoch, train_loss))
 
         # save checkpoint every epoch
         if self.args.no_val:
@@ -207,10 +212,10 @@ class Trainer(object):
                     'best_pred': self.best_pred
                 }, is_best)
 
-    def validation(self, epoch):
+    def validation(self, epoch, kbar):
         self.model.eval()
         self.evaluator.reset()
-        test_loss = 0.0
+        val_loss = 0.0
 
         for batch_id, batch in enumerate(self.val_loader):
             if self.args.dataset == 'Landslide4Sense':
@@ -224,9 +229,9 @@ class Trainer(object):
             with torch.no_grad():
                 output = self.model(image)
 
-            loss = self.criterion(output, target)
-            test_loss += loss.item()
-            print('Test Loss:%.3f' % (test_loss / (batch_id + 1)))
+            loss = self.criterion(output, target.long())
+            val_loss += loss.item()
+            # print('Val Loss:%.3f' % (val_loss / (batch_id + 1)))
             pred = output.data.cpu().numpy()
             target = target.cpu().numpy()
             pred = np.argmax(pred, axis=1)
@@ -239,11 +244,17 @@ class Trainer(object):
         acc_class = self.evaluator.pixel_accuracy_class()
         mIoU = self.evaluator.mean_intersection_over_union()
         fwIoU = self.evaluator.frequency_weighted_intersection_over_union()
+        p = self.evaluator.precision()
+        r = self.evaluator.recall()
+        f1 = self.evaluator.f1()
 
-        print('Validation:')
-        print('[Epoch: %d, numImages: %5d]' % (epoch, batch_id * self.args.batch_size + image.shape[0]))
-        print("Acc:{:.5f}, Acc_class:{:.5f}, mIoU:{:.5f}, fwIoU:{:.5f}".format(acc, acc_class, mIoU, fwIoU))
-        print('Loss: %.3f' % test_loss)
+        kbar.add(1, values=[("val_loss", val_loss), ("val_acc", acc),
+                            ('acc_class', acc_class), ('mIoU', mIoU),
+                            ('fwIoU', fwIoU), ('precision', p[1]),
+                            ('recall', r[1]), ('f1', f1[1])])
+
+        # print('Validation:')
+        # print("Epoch %d: val_loss:{:.5f}, Acc:{:.5f}, Acc_class:{:.5f}, mIoU:{:.5f}, fwIoU:{:.5f}".format(epoch, val_loss, acc, acc_class, mIoU, fwIoU))
 
         new_pred = mIoU
 
@@ -287,14 +298,19 @@ def main():
 
     trainer = Trainer(args)
 
-    print('Starting Epoch:', trainer.args.start_epoch)
-    print('Total Epoch:', trainer.args.epochs)
+    # print('Starting Epoch:', trainer.args.start_epoch)
+    # print('Total Epoch:', trainer.args.epochs)
+
+    # train_per_epoch = np.ceil(get_size_dataset("./data/TrainData" + str(fold) + "/train/img/") / args.batch_size)
+    train_per_epoch = np.ceil(helper.get_size_dataset('/content/FPN-LandSlide/data/train.txt') / args.batch_size)
 
     for epoch in range(trainer.args.start_epoch, trainer.args.epochs):
-        trainer.training(epoch)
+        kbar = Kpar.Kbar(target=train_per_epoch, epoch=epoch, num_epochs=args.epochs, width=25, always_stateful=False)
+
+        trainer.training(epoch, kbar)
 
         if not trainer.args.no_val and epoch % args.eval_interval == (args.eval_interval - 1):
-            trainer.validation(epoch)
+            trainer.validation(epoch, kbar)
 
 
 if __name__ == '__main__':

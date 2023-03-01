@@ -4,17 +4,14 @@ from __future__ import print_function
 
 import argparse
 import os
-import numpy as np
-
 import torch
+import numpy as np
 from torch.autograd import Variable
 
 from dataset import make_data_loader
-
 from utils.metrics import Evaluator
 from utils.saver import Saver
 from utils.loss import SegmentationLosses
-
 from model.FPN import FPN
 
 
@@ -22,13 +19,21 @@ def parse_args():
     """Parse input arguments"""
     parser = argparse.ArgumentParser(description='Train a FPN Semantic Segmentation network')
 
+    parser.add_argument("--data_dir", type=str, default='./data/',
+                        help="dataset path.")
+    parser.add_argument("--train_list", type=str, default='./data/train.txt',
+                        help="training list file.")
+    parser.add_argument("--val_list", type=str, default='./data/val.txt',
+                        help="val list file.")
+    parser.add_argument("--test_list", type=str, default='./data/test.txt',
+                        help="test list file.")
     parser.add_argument('--dataset', dest='dataset', type=str, default='Landslide4Sense',
                         help='training dataset')
     parser.add_argument('--net', dest='net', type=str, default='resnet101',
                         help='resnet18, resnet34, resnet50, etc.')
     parser.add_argument('--start_epoch', dest='start_epoch', type=int, default=1,
                         help='starting epoch')
-    parser.add_argument('--epochs', dest='epochs', type=int, default=35,
+    parser.add_argument('--epochs', dest='epochs', type=int, default=50,
                         help='number of iterations to train')
     parser.add_argument('--save_dir', dest='save_dir', default=None, nargs=argparse.REMAINDER,
                         help='directory to save models')
@@ -52,13 +57,13 @@ def parse_args():
     # config optimization
     parser.add_argument('--o', dest='optimizer', type=str, default='sgd',
                         help='training optimizer')
-    parser.add_argument('--lr', dest='lr', type=float, default=0.01,
+    parser.add_argument('--lr', dest='lr', type=float, default=1e-2,
                         help='starting learning rate')
     parser.add_argument('--weight_decay', dest='weight_decay', type=float, default=1e-5,
                         help='weight_decay')
     parser.add_argument('--lr_decay_step', dest='lr_decay_step', type=int, default=50,
                         help='step to do learning rate decay, uint is epoch')
-    parser.add_argument('--lr_decay_gamma', dest='lr_decay_gamma', type=float, default=0.1,
+    parser.add_argument('--lr_decay_gamma', dest='lr_decay_gamma', type=float, default=1e-1,
                         help='learning rate decay ratio')
 
     # set training session
@@ -120,7 +125,7 @@ class Trainer(object):
 
         # Define network
         if args.net == 'resnet101':
-            blocks = [2, 4, 23, 3]
+            blocks = [3, 4, 23, 3]
             fpn = FPN(blocks, args.num_class, back_bone=args.net)
 
         # Define Optimizer
